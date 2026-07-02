@@ -25,6 +25,14 @@ npm run build
 
 The production build writes `main.js`.
 
+## Release Assets
+
+Upload these files to each GitHub Release:
+
+- `main.js`
+- `manifest.json`
+- `styles.css`
+
 ## License
 
 MIT

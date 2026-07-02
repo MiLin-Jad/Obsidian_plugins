@@ -35,16 +35,46 @@ const DEFAULT_SETTINGS: ImageAutoRenameSettings = {
 
 const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg"]);
 const PROCESSED_NAME_PATTERN = /^.+_\d{6}$/;
+const FILENAME_HIDE_CLASS = "image-auto-rename-filenames-hidden";
+const FILENAME_HOVER_CLASS = "image-auto-rename-filenames-hover";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function isOptionalString(value: unknown): value is string | undefined {
+	return value === undefined || typeof value === "string";
+}
+
+function isFilenameDisplayMode(value: unknown): value is FilenameDisplayMode {
+	return value === "show" || value === "hide" || value === "hover";
+}
+
+function isCanvasFileNode(value: unknown): value is CanvasFileNode {
+	return isRecord(value) && isOptionalString(value.id) && isOptionalString(value.type) && isOptionalString(value.file);
+}
+
+function isCanvasEdge(value: unknown): value is CanvasEdge {
+	return isRecord(value) && isOptionalString(value.fromNode) && isOptionalString(value.toNode);
+}
+
+function isCanvasData(value: unknown): value is CanvasData {
+	if (!isRecord(value)) {
+		return false;
+	}
+
+	const { nodes, edges } = value;
+	return (nodes === undefined || (Array.isArray(nodes) && nodes.every(isCanvasFileNode))) && (edges === undefined || (Array.isArray(edges) && edges.every(isCanvasEdge)));
+}
 
 export default class ImageAutoRenamePlugin extends Plugin {
 	settings: ImageAutoRenameSettings;
 	private processingPaths = new Set<string>();
 	private renameQueue = Promise.resolve();
-	private styleEl: HTMLStyleElement | null = null;
 
 	async onload() {
 		await this.loadSettings();
-		this.applyFilenameDisplayCss();
+		this.applyFilenameDisplayMode();
 		this.addSettingTab(new ImageAutoRenameSettingTab(this.app, this));
 
 		this.registerEvent(
@@ -56,9 +86,9 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		);
 	}
 
-	async onunload() {
-		this.removeFilenameDisplayCss();
-		await this.saveSettings();
+	onunload() {
+		this.clearFilenameDisplayMode();
+		void this.saveSettings();
 	}
 
 	private enqueueRename(file: TFile) {
@@ -165,14 +195,14 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		return this.app.metadataCache.getFirstLinkpathDest(link, sourcePath);
 	}
 
-	private async readCanvasData(canvasFile: TFile) {
+	private async readCanvasData(canvasFile: TFile): Promise<CanvasData> {
 		const content = await this.app.vault.cachedRead(canvasFile);
-		return JSON.parse(content) as CanvasData;
+		return this.parseCanvasData(content);
 	}
 
-	private async updateCanvasImageReferences(canvasFile: TFile, renameResults: RenameResult[]) {
+	private async updateCanvasImageReferences(canvasFile: TFile, renameResults: RenameResult[]): Promise<void> {
 		const content = await this.app.vault.cachedRead(canvasFile);
-		const canvasData = JSON.parse(content) as CanvasData;
+		const canvasData = this.parseCanvasData(content);
 		let changed = false;
 
 		for (const node of canvasData.nodes ?? []) {
@@ -202,9 +232,9 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		}
 	}
 
-	private async removeMissingCanvasImageNodes(canvasFile: TFile) {
+	private async removeMissingCanvasImageNodes(canvasFile: TFile): Promise<number> {
 		const content = await this.app.vault.cachedRead(canvasFile);
-		const canvasData = JSON.parse(content) as CanvasData;
+		const canvasData = this.parseCanvasData(content);
 		const removedNodeIds = new Set<string>();
 		const originalNodes = canvasData.nodes ?? [];
 		const remainingNodes = originalNodes.filter((node) => {
@@ -236,7 +266,7 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		return originalNodes.length - remainingNodes.length;
 	}
 
-	private async normalizeImageSequence(sourceFile: TFile, imageFiles: TFile[]) {
+	private async normalizeImageSequence(sourceFile: TFile, imageFiles: TFile[]): Promise<RenameResult[]> {
 		const projectName = this.getCurrentNoteName(imageFiles[0], sourceFile);
 		const plans: RenameResult[] = [];
 		const sourcePaths = new Set(imageFiles.map((file) => file.path));
@@ -297,7 +327,7 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		return plans;
 	}
 
-	private async getAvailableTempPath(folderPath: string, extension: string, index: number) {
+	private async getAvailableTempPath(folderPath: string, extension: string, index: number): Promise<string> {
 		let attempt = 0;
 
 		while (true) {
@@ -315,20 +345,17 @@ export default class ImageAutoRenamePlugin extends Plugin {
 	private async refreshOpenFileView(file: TFile) {
 		const viewType = file.extension === "canvas" ? "canvas" : "markdown";
 		const leaves = this.app.workspace.getLeavesOfType(viewType);
-		const activeLeaf = this.app.workspace.activeLeaf;
 
 		for (const leaf of leaves) {
 			const leafFile = "file" in leaf.view ? leaf.view.file : null;
 
 			if (leafFile instanceof TFile && leafFile.path === file.path) {
-				await leaf.openFile(file, {
-					active: leaf === activeLeaf,
-				});
+				await leaf.openFile(file);
 			}
 		}
 	}
 
-	private async renameImage(file: TFile, noteFile?: TFile) {
+	private async renameImage(file: TFile, noteFile?: TFile): Promise<RenameResult | null> {
 		if (!this.shouldProcess(file)) {
 			return null;
 		}
@@ -380,7 +407,7 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		return !PROCESSED_NAME_PATTERN.test(file.basename);
 	}
 
-	private async getNextSequence(projectName: string, targetFolderPath: string, sourceFile?: TFile) {
+	private async getNextSequence(projectName: string, targetFolderPath: string, sourceFile?: TFile): Promise<number> {
 		const usedSequences = new Set<number>();
 
 		if (sourceFile) {
@@ -412,7 +439,7 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		return Math.max(0, ...usedSequences) + 1;
 	}
 
-	private async getReferencedImageBasenamesInFile(sourceFile: TFile) {
+	private async getReferencedImageBasenamesInFile(sourceFile: TFile): Promise<string[]> {
 		if (sourceFile.extension === "canvas") {
 			const canvasData = await this.readCanvasData(sourceFile);
 
@@ -476,7 +503,7 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		return safeName || "Vault";
 	}
 
-	private async getTargetFolderPath(file: TFile) {
+	private async getTargetFolderPath(file: TFile): Promise<string> {
 		const configuredFolder = this.normalizeFolderPath(this.settings.targetFolder);
 		const targetFolderPath = configuredFolder || file.parent?.path || "";
 
@@ -485,7 +512,7 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		return targetFolderPath;
 	}
 
-	private normalizeFolderPath(folderPath: string) {
+	private normalizeFolderPath(folderPath: string): string {
 		const normalizedPath = normalizePath(folderPath.trim());
 
 		if (normalizedPath === "." || normalizedPath === "/") {
@@ -495,7 +522,7 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		return normalizedPath.replace(/^\/+|\/+$/g, "");
 	}
 
-	private async ensureFolderExists(folderPath: string) {
+	private async ensureFolderExists(folderPath: string): Promise<void> {
 		if (!folderPath) {
 			return;
 		}
@@ -529,60 +556,58 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		}
 	}
 
-	private async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+	private async loadSettings(): Promise<void> {
+		const loadedData = (await this.loadData()) as unknown;
+		const loadedSettings = this.parseSettings(loadedData);
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedSettings);
 	}
 
-	async saveSettings() {
+	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
 	}
 
-	applyFilenameDisplayCss() {
-		this.removeFilenameDisplayCss();
+	private parseCanvasData(content: string): CanvasData {
+		const parsed = JSON.parse(content) as unknown;
 
-		if (this.settings.filenameDisplayMode === "show") {
-			return;
+		if (!isCanvasData(parsed)) {
+			throw new Error("Invalid canvas data.");
 		}
 
-		this.styleEl = document.createElement("style");
-		this.styleEl.id = "image-auto-rename-filename-display";
-		this.styleEl.textContent = this.getFilenameDisplayCss();
-		document.head.appendChild(this.styleEl);
+		return parsed;
 	}
 
-	private removeFilenameDisplayCss() {
-		this.styleEl?.remove();
-		this.styleEl = null;
+	private parseSettings(value: unknown): Partial<ImageAutoRenameSettings> {
+		if (!isRecord(value)) {
+			return {};
+		}
+
+		const settings: Partial<ImageAutoRenameSettings> = {};
+
+		if (typeof value.targetFolder === "string") {
+			settings.targetFolder = value.targetFolder;
+		}
+
+		if (isFilenameDisplayMode(value.filenameDisplayMode)) {
+			settings.filenameDisplayMode = value.filenameDisplayMode;
+		}
+
+		return settings;
 	}
 
-	private getFilenameDisplayCss() {
+	applyFilenameDisplayMode() {
+		this.clearFilenameDisplayMode();
+
 		if (this.settings.filenameDisplayMode === "hide") {
-			return `
-.canvas-node-label {
-	display: none !important;
-}
-`;
+			document.body.classList.add(FILENAME_HIDE_CLASS);
 		}
 
-		return `
-.canvas-node {
-	border-radius: 8px;
-	border: 1px solid rgba(255, 255, 255, 0.06);
-}
+		if (this.settings.filenameDisplayMode === "hover") {
+			document.body.classList.add(FILENAME_HOVER_CLASS);
+		}
+	}
 
-.canvas-node:hover {
-	border: 1px solid rgba(0, 150, 255, 0.6);
-}
-
-.canvas-node-label {
-	opacity: 0;
-	transition: opacity 0.2s;
-}
-
-.canvas-node:hover .canvas-node-label {
-	opacity: 1;
-}
-`;
+	private clearFilenameDisplayMode() {
+		document.body.classList.remove(FILENAME_HIDE_CLASS, FILENAME_HOVER_CLASS);
 	}
 }
 
@@ -624,7 +649,7 @@ class ImageAutoRenameSettingTab extends PluginSettingTab {
 					.onChange(async (value) => {
 						this.plugin.settings.filenameDisplayMode = value as FilenameDisplayMode;
 						await this.plugin.saveSettings();
-						this.plugin.applyFilenameDisplayCss();
+						this.plugin.applyFilenameDisplayMode();
 					})
 			);
 

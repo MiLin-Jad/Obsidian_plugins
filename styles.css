@@ -1,0 +1,21 @@
+body.image-auto-rename-filenames-hidden .canvas-node-label {
+	display: none !important;
+}
+
+body.image-auto-rename-filenames-hover .canvas-node {
+	border-radius: 8px;
+	border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+body.image-auto-rename-filenames-hover .canvas-node:hover {
+	border: 1px solid rgba(0, 150, 255, 0.6);
+}
+
+body.image-auto-rename-filenames-hover .canvas-node-label {
+	opacity: 0;
+	transition: opacity 0.2s;
+}
+
+body.image-auto-rename-filenames-hover .canvas-node:hover .canvas-node-label {
+	opacity: 1;
+}

@@ -1,7 +1,7 @@
 {
 	"id": "image-auto-rename",
 	"name": "Image Auto Rename",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"minAppVersion": "1.5.0",
 	"description": "Automatically rename newly created, pasted, or current-file images with the file name and a per-file sequence.",
 	"author": "Contributors",
