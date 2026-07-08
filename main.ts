@@ -238,7 +238,6 @@ export default class ImageAutoRenamePlugin extends Plugin {
 			type: IMAGE_AUTO_RENAME_VIEW_TYPE,
 			active: true,
 		});
-		this.app.workspace.revealLeaf(leaf);
 	}
 
 	t(key: keyof typeof UI_TEXT.en) {
@@ -1313,9 +1312,8 @@ class ImageAutoRenameSettingTab extends PluginSettingTab {
 
 	renderInto(containerEl: HTMLElement) {
 		containerEl.empty();
-		containerEl.createEl("h2", {
-			text: this.plugin.t("pageTitle"),
-		});
+
+		new Setting(containerEl).setName(this.plugin.t("pageTitle")).setHeading();
 
 		new Setting(containerEl)
 			.setName(this.plugin.t("languageName"))

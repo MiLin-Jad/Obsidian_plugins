@@ -4,7 +4,7 @@ Rename Img is an Obsidian plugin for keeping pasted image workflows tidy. It can
 
 ## Version
 
-Current version: `1.1.2`
+Current version: `1.1.3`
 
 ## Default Settings
 

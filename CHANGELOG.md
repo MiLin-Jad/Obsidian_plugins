@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.3
+
+- Removed an unsupported workspace API call for the declared minimum Obsidian version.
+- Updated the settings page heading to use Obsidian's standard `Setting#setHeading()` UI pattern.
+
 ## 1.1.2
 
 - Changed the plugin display name to `Rename Img` to meet Obsidian plugin directory naming requirements.
