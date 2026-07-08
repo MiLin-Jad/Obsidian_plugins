@@ -1,7 +1,7 @@
 {
 	"name": "obsidian-image-auto-rename",
-	"version": "1.0.1",
-	"description": "Obsidian plugin that automatically renames newly created or pasted images.",
+	"version": "1.0.2",
+	"description": "Obsidian plugin for image auto rename, file list cleanup, Bases defaults, and Baseline theme setup.",
 	"main": "main.js",
 	"scripts": {
 		"build": "node build.js --prod",
@@ -13,10 +13,11 @@
 		"image",
 		"rename"
 	],
-	"author": "Contributors",
+	"author": "MiLin",
 	"license": "MIT",
 	"devDependencies": {
 		"@types/node": "^20.11.30",
+		"builtin-modules": "^3.3.0",
 		"esbuild": "^0.28.1",
 		"obsidian": "^1.5.12",
 		"typescript": "^5.4.2"

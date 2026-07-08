@@ -1,10 +1,10 @@
 {
 	"id": "image-auto-rename",
 	"name": "Image Auto Rename",
-	"version": "1.0.1",
+	"version": "1.0.2",
 	"minAppVersion": "1.5.0",
-	"description": "Automatically rename newly created, pasted, or current-file images with the file name and a per-file sequence.",
-	"author": "Contributors",
+	"description": "Automatically rename images, clean file lists, create Bases defaults, style Base names, and apply the Baseline theme.",
+	"author": "MiLin",
 	"authorUrl": "",
 	"isDesktopOnly": false
 }

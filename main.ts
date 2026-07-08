@@ -1,4 +1,4 @@
-import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, normalizePath } from "obsidian";
+import { App, ColorComponent, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, normalizePath } from "obsidian";
 
 type FilenameDisplayMode = "show" | "hide" | "hover";
 
@@ -23,82 +23,180 @@ interface RenameResult {
 	targetPath: string;
 }
 
-interface ImageAutoRenameSettings {
-	targetFolder: string;
-	filenameDisplayMode: FilenameDisplayMode;
+interface BaseNameStyleRule {
+	extension: string;
+	color: string;
 }
 
+interface ImageAutoRenameSettings {
+	settingsVersion: number;
+	targetFolder: string;
+	useBaselineTheme: boolean;
+	filenameDisplayMode: FilenameDisplayMode;
+	hidePngInFileList: boolean;
+	autoRevealActiveFile: boolean;
+	baseNameStyleRules: BaseNameStyleRule[];
+}
+
+type LegacyImageAutoRenameSettings = Partial<ImageAutoRenameSettings> & {
+	baseStyledExtension?: string;
+	baseStyledNameColor?: string;
+};
+
 const DEFAULT_SETTINGS: ImageAutoRenameSettings = {
+	settingsVersion: 3,
 	targetFolder: "",
-	filenameDisplayMode: "show",
+	useBaselineTheme: true,
+	filenameDisplayMode: "hover",
+	hidePngInFileList: true,
+	autoRevealActiveFile: false,
+	baseNameStyleRules: [
+		{
+			extension: "canvas",
+			color: "#f9a8d4",
+		},
+		{
+			extension: "md",
+			color: "#3f3f46",
+		},
+	],
 };
 
 const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg"]);
 const PROCESSED_NAME_PATTERN = /^.+_\d{6}$/;
-const FILENAME_HIDE_CLASS = "image-auto-rename-filenames-hidden";
-const FILENAME_HOVER_CLASS = "image-auto-rename-filenames-hover";
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
-}
-
-function isOptionalString(value: unknown): value is string | undefined {
-	return value === undefined || typeof value === "string";
-}
-
-function isFilenameDisplayMode(value: unknown): value is FilenameDisplayMode {
-	return value === "show" || value === "hide" || value === "hover";
-}
-
-function isCanvasFileNode(value: unknown): value is CanvasFileNode {
-	return isRecord(value) && isOptionalString(value.id) && isOptionalString(value.type) && isOptionalString(value.file);
-}
-
-function isCanvasEdge(value: unknown): value is CanvasEdge {
-	return isRecord(value) && isOptionalString(value.fromNode) && isOptionalString(value.toNode);
-}
-
-function isCanvasData(value: unknown): value is CanvasData {
-	if (!isRecord(value)) {
-		return false;
-	}
-
-	const { nodes, edges } = value;
-	return (nodes === undefined || (Array.isArray(nodes) && nodes.every(isCanvasFileNode))) && (edges === undefined || (Array.isArray(edges) && edges.every(isCanvasEdge)));
-}
+const BASELINE_THEME_NAME = "Baseline";
+const BUNDLED_BASELINE_THEME_FILES: Record<string, string> = {
+	"manifest.json": "baseline-manifest.json",
+	"theme.css": "baseline-theme.css",
+};
+const DEFAULT_BASE_NAME_STYLE_COLOR = "#3f3f46";
+const DEFAULT_BASE_FILE_NAME = "Files.base";
+const DEFAULT_BASE_CONTENT = `filters:
+  and:
+    - 'file.ext != "png"'
+    - 'file.ext != "base"'
+properties:
+  file.name:
+    displayName: "名称"
+  file.ext:
+    displayName: "扩展名"
+  file.tags:
+    displayName: "tags"
+  note.aliases:
+    displayName: "aliases"
+  file.backlinks:
+    displayName: "文件反向链接"
+  file.mtime:
+    displayName: "修改时间"
+views:
+  - type: table
+    name: "Files"
+    order:
+      - file.name
+      - file.ext
+      - file.tags
+      - note.aliases
+      - file.backlinks
+      - file.mtime
+`;
 
 export default class ImageAutoRenamePlugin extends Plugin {
 	settings: ImageAutoRenameSettings;
 	private processingPaths = new Set<string>();
 	private renameQueue = Promise.resolve();
+	private styleEl: HTMLStyleElement | null = null;
+	private fileListStyleEl: HTMLStyleElement | null = null;
+	private baseStyleObserver: MutationObserver | null = null;
+	private baseStyleTimeout: number | null = null;
+	private baseStyleRetryTimeouts: number[] = [];
+	private autoRevealTimeout: number | null = null;
+	private missingBaselineThemeNotified = false;
 
 	async onload() {
 		await this.loadSettings();
-		this.applyFilenameDisplayMode();
+		void this.applyBaselineTheme();
+		this.applyFilenameDisplayCss();
+		this.applyFileListCss();
+		this.startBaseStyleObserver();
+		this.scheduleBaseStyleRefresh();
 		this.addSettingTab(new ImageAutoRenameSettingTab(this.app, this));
 
+		this.addCommand({
+			id: "create-default-base",
+			name: "Create default base",
+			callback: () => {
+				this.createDefaultBase();
+			},
+		});
+
 		this.registerEvent(
-			this.app.vault.on("create", (file) => {
-				if (file instanceof TFile) {
-					this.enqueueRename(file);
-				}
+			this.app.workspace.on("layout-change", () => {
+				this.scheduleBaseStyleRefresh();
 			})
 		);
+		this.registerEvent(
+			this.app.workspace.on("file-open", () => {
+				this.scheduleBaseStyleRefresh();
+				this.queueRevealActiveFile();
+			})
+		);
+		this.registerEvent(
+			this.app.workspace.on("active-leaf-change", () => {
+				this.scheduleBaseStyleRefresh();
+				this.queueRevealActiveFile();
+			})
+		);
+
+		this.app.workspace.onLayoutReady(() => {
+			this.registerEvent(
+				this.app.vault.on("create", (file) => {
+					if (file instanceof TFile) {
+						this.enqueueRename(file);
+					}
+				})
+			);
+			this.scheduleBaseStyleRefresh();
+			void this.applyBaselineTheme();
+			window.setTimeout(() => {
+				void this.applyBaselineTheme();
+			}, 1000);
+		});
 	}
 
-	onunload() {
-		this.clearFilenameDisplayMode();
-		void this.saveSettings();
+	async onunload() {
+		this.removeFilenameDisplayCss();
+		this.removeFileListCss();
+		this.stopBaseStyleObserver();
+		this.clearAutoRevealTimeout();
+		await this.saveSettings();
 	}
 
 	private enqueueRename(file: TFile) {
+		const sourceFile = this.getActiveReferenceSource(file);
+
 		this.renameQueue = this.renameQueue
 			.then(async () => {
-				await this.renameImage(file);
+				const renameResult = await this.renameImage(file, sourceFile);
+
+				if (renameResult && sourceFile) {
+					void this.repairAutoRenameReferences(sourceFile, renameResult).catch((error) => {
+						console.error("Failed to update renamed image references:", error);
+					});
+				}
 			})
 			.catch((error) => {
 				console.error("Image auto rename queue failed:", error);
 			});
+	}
+
+	private getActiveReferenceSource(file: TFile) {
+		const activeFile = this.app.workspace.getActiveFile();
+
+		if (!activeFile || activeFile.path === file.path) {
+			return undefined;
+		}
+
+		return activeFile.extension === "md" || activeFile.extension === "canvas" ? activeFile : undefined;
 	}
 
 	async renameImagesInActiveNote() {
@@ -117,6 +215,33 @@ export default class ImageAutoRenamePlugin extends Plugin {
 			});
 
 		await this.renameQueue;
+	}
+
+	async createDefaultBase() {
+		try {
+			const path = await this.getAvailableBasePath(DEFAULT_BASE_FILE_NAME);
+			const baseFile = await this.app.vault.create(path, DEFAULT_BASE_CONTENT);
+			await this.app.workspace.getLeaf(true).openFile(baseFile);
+			new Notice(`Created base: ${path}`);
+		} catch (error) {
+			console.error("Failed to create default base:", error);
+			new Notice("Failed to create base. See console for details.");
+		}
+	}
+
+	private async getAvailableBasePath(fileName: string) {
+		const extensionIndex = fileName.lastIndexOf(".");
+		const basename = extensionIndex === -1 ? fileName : fileName.slice(0, extensionIndex);
+		const extension = extensionIndex === -1 ? "" : fileName.slice(extensionIndex);
+		let path = fileName;
+		let index = 1;
+
+		while (await this.app.vault.adapter.exists(path)) {
+			path = `${basename} ${index}${extension}`;
+			index += 1;
+		}
+
+		return path;
 	}
 
 	private async renameImagesInFile(sourceFile: TFile) {
@@ -195,14 +320,14 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		return this.app.metadataCache.getFirstLinkpathDest(link, sourcePath);
 	}
 
-	private async readCanvasData(canvasFile: TFile): Promise<CanvasData> {
+	private async readCanvasData(canvasFile: TFile) {
 		const content = await this.app.vault.cachedRead(canvasFile);
-		return this.parseCanvasData(content);
+		return JSON.parse(content) as CanvasData;
 	}
 
-	private async updateCanvasImageReferences(canvasFile: TFile, renameResults: RenameResult[]): Promise<void> {
+	private async updateCanvasImageReferences(canvasFile: TFile, renameResults: RenameResult[]) {
 		const content = await this.app.vault.cachedRead(canvasFile);
-		const canvasData = this.parseCanvasData(content);
+		const canvasData = JSON.parse(content) as CanvasData;
 		let changed = false;
 
 		for (const node of canvasData.nodes ?? []) {
@@ -214,6 +339,7 @@ export default class ImageAutoRenamePlugin extends Plugin {
 			const linkedFile = this.resolveLinkedFile(node.file, canvasFile.path);
 			const renameResult = renameResults.find(
 				(result) =>
+					this.linkMatchesRenameSource(node.file ?? "", result) ||
 					result.sourcePath === node.file ||
 					result.sourcePath === nodeFilePath ||
 					result.targetPath === node.file ||
@@ -230,11 +356,145 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		if (changed) {
 			await this.app.vault.modify(canvasFile, JSON.stringify(canvasData, null, "\t"));
 		}
+
+		return changed;
 	}
 
-	private async removeMissingCanvasImageNodes(canvasFile: TFile): Promise<number> {
+	private async repairAutoRenameReferences(sourceFile: TFile, renameResult: RenameResult) {
+		for (const delay of [0, 100, 300, 700, 1500]) {
+			await this.sleep(delay);
+
+			const latestSourceFile = this.app.vault.getAbstractFileByPath(sourceFile.path);
+
+			if (!(latestSourceFile instanceof TFile)) {
+				return;
+			}
+
+			const changed = await this.updateRenamedImageReferences(latestSourceFile, renameResult);
+
+			if (changed) {
+				return;
+			}
+		}
+	}
+
+	private async updateRenamedImageReferences(sourceFile: TFile, renameResult: RenameResult) {
+		if (sourceFile.extension === "canvas") {
+			return await this.updateCanvasImageReferences(sourceFile, [renameResult]);
+		}
+
+		if (sourceFile.extension !== "md") {
+			return false;
+		}
+
+		return await this.updateMarkdownImageReferences(sourceFile, renameResult);
+	}
+
+	private async updateMarkdownImageReferences(markdownFile: TFile, renameResult: RenameResult) {
+		const content = await this.app.vault.cachedRead(markdownFile);
+		const updatedContent = this.replaceMarkdownImageReferences(content, renameResult);
+
+		if (updatedContent === content) {
+			return false;
+		}
+
+		await this.app.vault.modify(markdownFile, updatedContent);
+		return true;
+	}
+
+	private replaceMarkdownImageReferences(content: string, renameResult: RenameResult) {
+		const wikiLinkPattern = /(!?\[\[)([^\]]+)(\]\])/g;
+		const markdownImagePattern = /(!\[[^\]]*\]\()([^)]+)(\))/g;
+
+		return content
+			.replace(wikiLinkPattern, (match, open: string, inner: string, close: string) => {
+				if (!open.startsWith("!")) {
+					return match;
+				}
+
+				const separatorIndex = inner.indexOf("|");
+				const linkPart = separatorIndex === -1 ? inner : inner.slice(0, separatorIndex);
+				const aliasPart = separatorIndex === -1 ? "" : inner.slice(separatorIndex);
+				const headingIndex = linkPart.indexOf("#");
+				const pathPart = headingIndex === -1 ? linkPart : linkPart.slice(0, headingIndex);
+				const subpathPart = headingIndex === -1 ? "" : linkPart.slice(headingIndex);
+
+				if (!this.linkMatchesRenameSource(pathPart, renameResult)) {
+					return match;
+				}
+
+				return `${open}${renameResult.targetPath}${subpathPart}${aliasPart}${close}`;
+			})
+			.replace(markdownImagePattern, (match, open: string, destination: string, close: string) => {
+				const parsedDestination = this.parseMarkdownDestination(destination);
+
+				if (!this.linkMatchesRenameSource(parsedDestination.path, renameResult)) {
+					return match;
+				}
+
+				return `${open}${this.formatMarkdownDestination(renameResult.targetPath, parsedDestination)}${close}`;
+			});
+	}
+
+	private parseMarkdownDestination(destination: string) {
+		const trimmedDestination = destination.trim();
+
+		if (trimmedDestination.startsWith("<")) {
+			const closingIndex = trimmedDestination.indexOf(">");
+
+			if (closingIndex !== -1) {
+				return {
+					path: trimmedDestination.slice(1, closingIndex),
+					prefix: "<",
+					suffix: `>${trimmedDestination.slice(closingIndex + 1)}`,
+				};
+			}
+		}
+
+		const titleMatch = trimmedDestination.match(/^(\S+)(\s+["'][\s\S]+)$/);
+
+		return {
+			path: titleMatch ? titleMatch[1] : trimmedDestination,
+			prefix: "",
+			suffix: titleMatch ? titleMatch[2] : "",
+		};
+	}
+
+	private formatMarkdownDestination(targetPath: string, destination: { prefix: string; suffix: string }) {
+		if (destination.prefix === "<") {
+			return `<${targetPath}>${destination.suffix.slice(1)}`;
+		}
+
+		return `${encodeURI(targetPath)}${destination.suffix}`;
+	}
+
+	private linkMatchesRenameSource(linkPath: string, renameResult: RenameResult) {
+		const normalizedLinkPath = this.normalizeLinkPath(linkPath);
+		const normalizedSourcePath = normalizePath(renameResult.sourcePath);
+		const sourceFileName = normalizedSourcePath.split("/").pop() ?? normalizedSourcePath;
+
+		return normalizedLinkPath === normalizedSourcePath || normalizedLinkPath === sourceFileName || normalizedLinkPath.endsWith(`/${sourceFileName}`);
+	}
+
+	private normalizeLinkPath(linkPath: string) {
+		return normalizePath(this.decodeLinkPath(linkPath).trim());
+	}
+
+	private decodeLinkPath(linkPath: string) {
+		try {
+			return decodeURI(linkPath);
+		} catch {
+			return linkPath;
+		}
+	}
+
+	private sleep(ms: number) {
+		return new Promise((resolve) => window.setTimeout(resolve, ms));
+	}
+
+	private async removeMissingCanvasImageNodes(canvasFile: TFile) {
 		const content = await this.app.vault.cachedRead(canvasFile);
-		const canvasData = this.parseCanvasData(content);
+		const canvasData = JSON.parse(content) as CanvasData;
 		const removedNodeIds = new Set<string>();
 		const originalNodes = canvasData.nodes ?? [];
 		const remainingNodes = originalNodes.filter((node) => {
@@ -266,7 +526,7 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		return originalNodes.length - remainingNodes.length;
 	}
 
-	private async normalizeImageSequence(sourceFile: TFile, imageFiles: TFile[]): Promise<RenameResult[]> {
+	private async normalizeImageSequence(sourceFile: TFile, imageFiles: TFile[]) {
 		const projectName = this.getCurrentNoteName(imageFiles[0], sourceFile);
 		const plans: RenameResult[] = [];
 		const sourcePaths = new Set(imageFiles.map((file) => file.path));
@@ -327,7 +587,7 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		return plans;
 	}
 
-	private async getAvailableTempPath(folderPath: string, extension: string, index: number): Promise<string> {
+	private async getAvailableTempPath(folderPath: string, extension: string, index: number) {
 		let attempt = 0;
 
 		while (true) {
@@ -345,17 +605,20 @@ export default class ImageAutoRenamePlugin extends Plugin {
 	private async refreshOpenFileView(file: TFile) {
 		const viewType = file.extension === "canvas" ? "canvas" : "markdown";
 		const leaves = this.app.workspace.getLeavesOfType(viewType);
+		const activeLeaf = this.app.workspace.activeLeaf;
 
 		for (const leaf of leaves) {
 			const leafFile = "file" in leaf.view ? leaf.view.file : null;
 
 			if (leafFile instanceof TFile && leafFile.path === file.path) {
-				await leaf.openFile(file);
+				await leaf.openFile(file, {
+					active: leaf === activeLeaf,
+				});
 			}
 		}
 	}
 
-	private async renameImage(file: TFile, noteFile?: TFile): Promise<RenameResult | null> {
+	private async renameImage(file: TFile, noteFile?: TFile) {
 		if (!this.shouldProcess(file)) {
 			return null;
 		}
@@ -407,7 +670,7 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		return !PROCESSED_NAME_PATTERN.test(file.basename);
 	}
 
-	private async getNextSequence(projectName: string, targetFolderPath: string, sourceFile?: TFile): Promise<number> {
+	private async getNextSequence(projectName: string, targetFolderPath: string, sourceFile?: TFile) {
 		const usedSequences = new Set<number>();
 
 		if (sourceFile) {
@@ -439,7 +702,7 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		return Math.max(0, ...usedSequences) + 1;
 	}
 
-	private async getReferencedImageBasenamesInFile(sourceFile: TFile): Promise<string[]> {
+	private async getReferencedImageBasenamesInFile(sourceFile: TFile) {
 		if (sourceFile.extension === "canvas") {
 			const canvasData = await this.readCanvasData(sourceFile);
 
@@ -503,7 +766,7 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		return safeName || "Vault";
 	}
 
-	private async getTargetFolderPath(file: TFile): Promise<string> {
+	private async getTargetFolderPath(file: TFile) {
 		const configuredFolder = this.normalizeFolderPath(this.settings.targetFolder);
 		const targetFolderPath = configuredFolder || file.parent?.path || "";
 
@@ -512,7 +775,7 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		return targetFolderPath;
 	}
 
-	private normalizeFolderPath(folderPath: string): string {
+	private normalizeFolderPath(folderPath: string) {
 		const normalizedPath = normalizePath(folderPath.trim());
 
 		if (normalizedPath === "." || normalizedPath === "/") {
@@ -522,7 +785,7 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		return normalizedPath.replace(/^\/+|\/+$/g, "");
 	}
 
-	private async ensureFolderExists(folderPath: string): Promise<void> {
+	private async ensureFolderExists(folderPath: string) {
 		if (!folderPath) {
 			return;
 		}
@@ -556,58 +819,438 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		}
 	}
 
-	private async loadSettings(): Promise<void> {
-		const loadedData = (await this.loadData()) as unknown;
-		const loadedSettings = this.parseSettings(loadedData);
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedSettings);
+	private async loadSettings() {
+		const loadedSettings = (await this.loadData()) as LegacyImageAutoRenameSettings | null;
+		this.settings = this.normalizeSettings(loadedSettings);
 	}
 
-	async saveSettings(): Promise<void> {
-		await this.saveData(this.settings);
+	async saveSettings() {
+		this.settings = this.normalizeSettings(this.settings);
+		await this.saveData({ ...this.settings });
 	}
 
-	private parseCanvasData(content: string): CanvasData {
-		const parsed = JSON.parse(content) as unknown;
+	private normalizeSettings(settings?: LegacyImageAutoRenameSettings | null): ImageAutoRenameSettings {
+		const isLegacySettings = settings?.settingsVersion !== DEFAULT_SETTINGS.settingsVersion;
+		const filenameDisplayMode = settings?.filenameDisplayMode ?? DEFAULT_SETTINGS.filenameDisplayMode;
+		const hidePngInFileList = typeof settings?.hidePngInFileList === "boolean" ? settings.hidePngInFileList : DEFAULT_SETTINGS.hidePngInFileList;
 
-		if (!isCanvasData(parsed)) {
-			throw new Error("Invalid canvas data.");
-		}
-
-		return parsed;
+		return {
+			settingsVersion: DEFAULT_SETTINGS.settingsVersion,
+			targetFolder: settings?.targetFolder ?? DEFAULT_SETTINGS.targetFolder,
+			useBaselineTheme: typeof settings?.useBaselineTheme === "boolean" ? settings.useBaselineTheme : DEFAULT_SETTINGS.useBaselineTheme,
+			filenameDisplayMode: this.normalizeFilenameDisplayMode(filenameDisplayMode, isLegacySettings),
+			hidePngInFileList: isLegacySettings && hidePngInFileList === false ? DEFAULT_SETTINGS.hidePngInFileList : hidePngInFileList,
+			autoRevealActiveFile: typeof settings?.autoRevealActiveFile === "boolean" ? settings.autoRevealActiveFile : DEFAULT_SETTINGS.autoRevealActiveFile,
+			baseNameStyleRules: this.normalizeBaseNameStyleRules(settings, isLegacySettings),
+		};
 	}
 
-	private parseSettings(value: unknown): Partial<ImageAutoRenameSettings> {
-		if (!isRecord(value)) {
-			return {};
+	private normalizeFilenameDisplayMode(value: string, isLegacySettings: boolean): FilenameDisplayMode {
+		if (isLegacySettings && value === "show") {
+			return DEFAULT_SETTINGS.filenameDisplayMode;
 		}
 
-		const settings: Partial<ImageAutoRenameSettings> = {};
-
-		if (typeof value.targetFolder === "string") {
-			settings.targetFolder = value.targetFolder;
-		}
-
-		if (isFilenameDisplayMode(value.filenameDisplayMode)) {
-			settings.filenameDisplayMode = value.filenameDisplayMode;
-		}
-
-		return settings;
+		return ["show", "hide", "hover"].includes(value) ? (value as FilenameDisplayMode) : DEFAULT_SETTINGS.filenameDisplayMode;
 	}
 
-	applyFilenameDisplayMode() {
-		this.clearFilenameDisplayMode();
+	normalizeColorSetting(color: string | undefined) {
+		return this.normalizeOptionalColorSetting(color) ?? DEFAULT_BASE_NAME_STYLE_COLOR;
+	}
 
+	normalizeOptionalColorSetting(color: string | undefined) {
+		const normalizedColor = (color ?? "").trim();
+		const colorWithHash = normalizedColor.startsWith("#") ? normalizedColor : `#${normalizedColor}`;
+		return /^#[0-9a-f]{6}$/i.test(colorWithHash) ? colorWithHash : null;
+	}
+
+	private normalizeBaseNameStyleRules(settings: LegacyImageAutoRenameSettings | null | undefined, isLegacySettings: boolean) {
+		if (Array.isArray(settings?.baseNameStyleRules)) {
+			return settings.baseNameStyleRules
+				.map((rule) => this.normalizeBaseNameStyleRule(rule))
+				.filter((rule): rule is BaseNameStyleRule => rule !== null);
+		}
+
+		const legacyExtension = this.normalizeExtensionSetting(settings?.baseStyledExtension ?? "");
+
+		if (!legacyExtension && isLegacySettings) {
+			return this.getDefaultBaseNameStyleRules();
+		}
+
+		if (!legacyExtension) {
+			return [];
+		}
+
+		return [
+			{
+				extension: legacyExtension,
+				color: this.normalizeColorSetting(settings?.baseStyledNameColor),
+			},
+		];
+	}
+
+	private getDefaultBaseNameStyleRules() {
+		return DEFAULT_SETTINGS.baseNameStyleRules.map((rule) => ({ ...rule }));
+	}
+
+	private normalizeBaseNameStyleRule(rule: Partial<BaseNameStyleRule> | null | undefined) {
+		const extension = this.normalizeExtensionSetting(rule?.extension ?? "");
+
+		if (!extension) {
+			return null;
+		}
+
+		return {
+			extension,
+			color: this.normalizeColorSetting(rule?.color),
+		};
+	}
+
+	async applyBaselineTheme() {
+		if (!this.settings.useBaselineTheme) {
+			return;
+		}
+
+		await this.installBundledBaselineTheme();
+
+		if (!(await this.isBaselineThemeInstalled())) {
+			this.notifyMissingBaselineTheme();
+			return;
+		}
+
+		const customCss = (this.app as App & { customCss?: { setTheme?: (theme: string) => void | Promise<void> } }).customCss;
+
+		if (!customCss?.setTheme) {
+			console.warn("Cannot apply Baseline theme: Obsidian theme API is unavailable.");
+			return;
+		}
+
+		await customCss.setTheme(BASELINE_THEME_NAME);
+	}
+
+	private async isBaselineThemeInstalled() {
+		const themePath = this.getInstalledBaselineThemeFilePath("theme.css");
+		return await this.app.vault.adapter.exists(themePath);
+	}
+
+	private async installBundledBaselineTheme() {
+		const sourceThemeCssPath = this.getBundledBaselineThemeFilePath("theme.css");
+
+		if (!(await this.app.vault.adapter.exists(sourceThemeCssPath))) {
+			return;
+		}
+
+		const targetThemeFolder = this.getInstalledBaselineThemeFolderPath();
+		await this.ensureAdapterFolderExists(targetThemeFolder);
+
+		for (const fileName of ["manifest.json", "theme.css"]) {
+			const sourcePath = this.getBundledBaselineThemeFilePath(fileName);
+
+			if (!(await this.app.vault.adapter.exists(sourcePath))) {
+				continue;
+			}
+
+			const content = await this.app.vault.adapter.read(sourcePath);
+			await this.app.vault.adapter.write(this.getInstalledBaselineThemeFilePath(fileName), content);
+		}
+	}
+
+	private getBundledBaselineThemeFilePath(fileName: string) {
+		const pluginDir = this.manifest.dir ?? "";
+		const bundledFileName = BUNDLED_BASELINE_THEME_FILES[fileName] ?? fileName;
+		return normalizePath(pluginDir ? `${pluginDir}/${bundledFileName}` : bundledFileName);
+	}
+
+	private getInstalledBaselineThemeFolderPath() {
+		return normalizePath(`${this.app.vault.configDir}/themes/${BASELINE_THEME_NAME}`);
+	}
+
+	private getInstalledBaselineThemeFilePath(fileName: string) {
+		return normalizePath(`${this.getInstalledBaselineThemeFolderPath()}/${fileName}`);
+	}
+
+	private async ensureAdapterFolderExists(folderPath: string) {
+		const parts = folderPath.split("/");
+		let currentPath = "";
+
+		for (const part of parts) {
+			currentPath = currentPath ? `${currentPath}/${part}` : part;
+
+			if (await this.app.vault.adapter.exists(currentPath)) {
+				continue;
+			}
+
+			await this.app.vault.adapter.mkdir(currentPath);
+		}
+	}
+
+	private notifyMissingBaselineTheme() {
+		if (this.missingBaselineThemeNotified) {
+			return;
+		}
+
+		this.missingBaselineThemeNotified = true;
+		new Notice("Baseline theme files were not found. Keep baseline-theme.css and baseline-manifest.json beside this plugin's main.js, then reload this plugin.");
+	}
+
+	queueRevealActiveFile() {
+		this.clearAutoRevealTimeout();
+
+		if (!this.settings.autoRevealActiveFile) {
+			return;
+		}
+
+		this.autoRevealTimeout = window.setTimeout(() => {
+			this.autoRevealTimeout = null;
+			this.revealActiveFileInExplorer();
+		}, 150);
+	}
+
+	clearAutoRevealTimeout() {
+		if (this.autoRevealTimeout === null) {
+			return;
+		}
+
+		window.clearTimeout(this.autoRevealTimeout);
+		this.autoRevealTimeout = null;
+	}
+
+	private revealActiveFileInExplorer() {
+		const activeFile = this.app.workspace.getActiveFile();
+
+		if (!activeFile) {
+			return;
+		}
+
+		const commands = (this.app as App & { commands?: { executeCommandById?: (id: string) => boolean } }).commands;
+
+		if (!commands?.executeCommandById) {
+			console.warn("Cannot reveal active file: Obsidian command API is unavailable.");
+			return;
+		}
+
+		commands.executeCommandById("file-explorer:reveal-active-file");
+	}
+
+	applyFilenameDisplayCss() {
+		this.removeFilenameDisplayCss();
+
+		if (this.settings.filenameDisplayMode === "show") {
+			return;
+		}
+
+		this.styleEl = document.createElement("style");
+		this.styleEl.id = "image-auto-rename-filename-display";
+		this.styleEl.textContent = this.getFilenameDisplayCss();
+		document.head.appendChild(this.styleEl);
+	}
+
+	private removeFilenameDisplayCss() {
+		this.styleEl?.remove();
+		this.styleEl = null;
+	}
+
+	private getFilenameDisplayCss() {
 		if (this.settings.filenameDisplayMode === "hide") {
-			activeDocument.body.classList.add(FILENAME_HIDE_CLASS);
+			return `
+.canvas-node-label {
+	display: none !important;
+}
+`;
 		}
 
-		if (this.settings.filenameDisplayMode === "hover") {
-			activeDocument.body.classList.add(FILENAME_HOVER_CLASS);
+		return `
+.canvas-node {
+	border-radius: 8px;
+	border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.canvas-node:hover {
+	border: 1px solid rgba(0, 150, 255, 0.6);
+}
+
+.canvas-node-label {
+	opacity: 0;
+	transition: opacity 0.2s;
+}
+
+.canvas-node:hover .canvas-node-label {
+	opacity: 1;
+}
+`;
+	}
+
+	applyFileListCss() {
+		this.removeFileListCss();
+
+		if (!this.settings.hidePngInFileList) {
+			return;
+		}
+
+		this.fileListStyleEl = document.createElement("style");
+		this.fileListStyleEl.id = "image-auto-rename-file-list";
+		this.fileListStyleEl.textContent = `
+.nav-file:has(.nav-file-title[data-path$=".png" i]),
+.tree-item:has(> .tree-item-self[data-path$=".png" i]) {
+	display: none !important;
+}
+
+.nav-file-title[data-path$=".png" i],
+.tree-item-self[data-path$=".png" i] {
+	display: none !important;
+}
+`;
+		document.head.appendChild(this.fileListStyleEl);
+	}
+
+	private removeFileListCss() {
+		this.fileListStyleEl?.remove();
+		this.fileListStyleEl = null;
+	}
+
+	getAvailableBaseStyleExtensions() {
+		const extensions = new Set(["md", "pdf", "jpg", "jpeg", "png", "webp", "gif", "canvas", "base"]);
+
+		for (const file of this.app.vault.getFiles()) {
+			if (file.extension) {
+				extensions.add(this.normalizeExtensionSetting(file.extension));
+			}
+		}
+
+		return [...extensions].filter((extension) => extension.length > 0).sort((a, b) => a.localeCompare(b));
+	}
+
+	refreshBaseNameStyles() {
+		this.clearBaseNameStyles();
+		this.scheduleBaseStyleRefresh();
+	}
+
+	private scheduleBaseStyleRefresh() {
+		this.clearBaseStyleRetryTimeouts();
+		this.queueApplyBaseNameStyles();
+
+		for (const delay of [250, 1000, 2500, 5000]) {
+			const timeoutId = window.setTimeout(() => {
+				this.baseStyleRetryTimeouts = this.baseStyleRetryTimeouts.filter((id) => id !== timeoutId);
+				this.queueApplyBaseNameStyles();
+			}, delay);
+
+			this.baseStyleRetryTimeouts.push(timeoutId);
 		}
 	}
 
-	private clearFilenameDisplayMode() {
-		activeDocument.body.classList.remove(FILENAME_HIDE_CLASS, FILENAME_HOVER_CLASS);
+	private clearBaseStyleRetryTimeouts() {
+		for (const timeoutId of this.baseStyleRetryTimeouts) {
+			window.clearTimeout(timeoutId);
+		}
+
+		this.baseStyleRetryTimeouts = [];
+	}
+
+	private startBaseStyleObserver() {
+		this.stopBaseStyleObserver();
+
+		this.baseStyleObserver = new MutationObserver(() => {
+			this.queueApplyBaseNameStyles();
+		});
+		this.baseStyleObserver.observe(document.body, {
+			childList: true,
+			subtree: true,
+		});
+	}
+
+	private stopBaseStyleObserver() {
+		this.baseStyleObserver?.disconnect();
+		this.baseStyleObserver = null;
+
+		if (this.baseStyleTimeout !== null) {
+			window.clearTimeout(this.baseStyleTimeout);
+			this.baseStyleTimeout = null;
+		}
+
+		this.clearBaseStyleRetryTimeouts();
+		this.clearBaseNameStyles();
+	}
+
+	private queueApplyBaseNameStyles() {
+		if (this.baseStyleTimeout !== null) {
+			return;
+		}
+
+		this.baseStyleTimeout = window.setTimeout(() => {
+			this.baseStyleTimeout = null;
+			this.applyBaseNameStyles();
+		}, 100);
+	}
+
+	private applyBaseNameStyles() {
+		this.clearBaseNameStyles();
+
+		const ruleByExtension = new Map(this.settings.baseNameStyleRules.map((rule) => [rule.extension, rule]));
+
+		if (ruleByExtension.size === 0) {
+			return;
+		}
+
+		for (const row of this.getBaseRows()) {
+			const extensionCell = this.getBaseCell(row, ["file.ext", "file.extension"]);
+			const nameCell = this.getBaseCell(row, ["file.name", "file.path"]);
+
+			if (!extensionCell || !nameCell) {
+				continue;
+			}
+
+			const rowExtension = this.normalizeExtensionSetting(extensionCell.textContent ?? "");
+			const rule = ruleByExtension.get(rowExtension);
+
+			if (!rule) {
+				continue;
+			}
+
+			this.styleBaseNameCell(nameCell, rule.color);
+		}
+	}
+
+	private clearBaseNameStyles() {
+		for (const element of document.querySelectorAll<HTMLElement>("[data-image-auto-rename-base-name-style='true']")) {
+			element.style.removeProperty("color");
+			element.style.removeProperty("font-weight");
+			element.removeAttribute("data-image-auto-rename-base-name-style");
+		}
+	}
+
+	private getBaseRows() {
+		const cellSelector = "[data-property='file.ext'], [data-property='file.extension'], [data-property='file.name'], [data-property='file.path']";
+		const rows = new Set<HTMLElement>();
+
+		for (const cell of document.querySelectorAll<HTMLElement>(cellSelector)) {
+			const row = cell.closest<HTMLElement>(".bases-tr, .bases-table-row, tr, [role='row']");
+
+			if (row) {
+				rows.add(row);
+			}
+		}
+
+		return [...rows];
+	}
+
+	private getBaseCell(row: HTMLElement, properties: string[]) {
+		const selector = properties.map((property) => `[data-property='${property}']`).join(", ");
+		return row.querySelector<HTMLElement>(selector);
+	}
+
+	private styleBaseNameCell(nameCell: HTMLElement, color: string) {
+		const targets = nameCell.querySelectorAll<HTMLElement>("a, span, div");
+		const elements = targets.length > 0 ? [...targets] : [nameCell];
+
+		for (const element of elements) {
+			element.style.color = color;
+			element.style.fontWeight = "700";
+			element.setAttribute("data-image-auto-rename-base-name-style", "true");
+		}
+	}
+
+	normalizeExtensionSetting(extension: string) {
+		return extension.trim().replace(/^\./, "").toLowerCase();
 	}
 }
 
@@ -638,6 +1281,22 @@ class ImageAutoRenameSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
+			.setName("Use Baseline theme")
+			.setDesc("Automatically install the bundled Baseline theme files and switch Obsidian to the Baseline theme when this plugin loads.")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.useBaselineTheme)
+					.onChange(async (value) => {
+						this.plugin.settings.useBaselineTheme = value;
+						await this.plugin.saveSettings();
+
+						if (value) {
+							await this.plugin.applyBaselineTheme();
+						}
+					})
+			);
+
+		new Setting(containerEl)
 			.setName("Image filename display")
 			.setDesc("Controls whether Canvas image node file names are visible.")
 			.addDropdown((dropdown) =>
@@ -649,7 +1308,88 @@ class ImageAutoRenameSettingTab extends PluginSettingTab {
 					.onChange(async (value) => {
 						this.plugin.settings.filenameDisplayMode = value as FilenameDisplayMode;
 						await this.plugin.saveSettings();
-						this.plugin.applyFilenameDisplayMode();
+						this.plugin.applyFilenameDisplayCss();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Hide PNG files in file list")
+			.setDesc("Hide .png files from Obsidian's file explorer. The files are only hidden visually and remain in the vault.")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.hidePngInFileList)
+					.onChange(async (value) => {
+						this.plugin.settings.hidePngInFileList = value;
+						await this.plugin.saveSettings();
+						this.plugin.applyFileListCss();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Reveal active file in file list")
+			.setDesc("Automatically expand the file explorer to the active file when opening or switching files.")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.autoRevealActiveFile)
+					.onChange(async (value) => {
+						this.plugin.settings.autoRevealActiveFile = value;
+						await this.plugin.saveSettings();
+
+						if (value) {
+							this.plugin.queueRevealActiveFile();
+						} else {
+							this.plugin.clearAutoRevealTimeout();
+						}
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Base name style rules")
+			.setDesc("Color and bold the Base name column by file extension. Add multiple rules for multiple extensions.");
+
+		this.plugin.settings.baseNameStyleRules.forEach((rule, index) => {
+			this.addBaseNameStyleRuleSetting(containerEl, rule, index);
+		});
+
+		new Setting(containerEl)
+			.setName("Add Base name style rule")
+			.setDesc("Add another extension color rule.")
+			.addButton((button) =>
+				button
+					.setButtonText("Add rule")
+					.setCta()
+					.onClick(async () => {
+						const extensions = this.plugin.getAvailableBaseStyleExtensions();
+						const usedExtensions = new Set(this.plugin.settings.baseNameStyleRules.map((rule) => rule.extension));
+						const extension = extensions.find((value) => !usedExtensions.has(value)) ?? extensions[0] ?? "md";
+
+						this.plugin.settings.baseNameStyleRules.push({
+							extension,
+							color: DEFAULT_BASE_NAME_STYLE_COLOR,
+						});
+						await this.plugin.saveSettings();
+						this.plugin.refreshBaseNameStyles();
+						this.display();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Create default base")
+			.setDesc("Create a Base with filters for not PNG and not Base files, plus the preset visible properties.")
+			.addButton((button) =>
+				button
+					.setButtonText("Create base")
+					.setCta()
+					.onClick(async () => {
+						button.setDisabled(true);
+						button.setButtonText("Creating...");
+
+						try {
+							await this.plugin.createDefaultBase();
+						} finally {
+							button.setDisabled(false);
+							button.setButtonText("Create base");
+						}
 					})
 			);
 
@@ -672,5 +1412,78 @@ class ImageAutoRenameSettingTab extends PluginSettingTab {
 						}
 					})
 			);
+	}
+
+	private addBaseNameStyleRuleSetting(containerEl: HTMLElement, rule: BaseNameStyleRule, index: number) {
+		let colorPicker: ColorComponent | null = null;
+		const currentColor = this.plugin.normalizeColorSetting(rule.color);
+
+		new Setting(containerEl)
+			.setName(`Base style rule ${index + 1}`)
+			.setDesc("Matching Base names are colored and bold.")
+			.addDropdown((dropdown) => {
+				const extensions = this.plugin.getAvailableBaseStyleExtensions();
+				const currentExtension = this.plugin.normalizeExtensionSetting(rule.extension);
+
+				for (const extension of extensions) {
+					dropdown.addOption(extension, extension);
+				}
+
+				if (currentExtension && !extensions.includes(currentExtension)) {
+					dropdown.addOption(currentExtension, currentExtension);
+				}
+
+				dropdown.setValue(currentExtension).onChange(async (value) => {
+					this.plugin.settings.baseNameStyleRules[index] = {
+						...this.plugin.settings.baseNameStyleRules[index],
+						extension: this.plugin.normalizeExtensionSetting(value),
+					};
+					await this.plugin.saveSettings();
+					this.plugin.refreshBaseNameStyles();
+					this.display();
+				});
+			})
+			.addText((text) =>
+				text
+					.setPlaceholder("#3f3f46")
+					.setValue(currentColor)
+					.onChange(async (value) => {
+						const color = this.plugin.normalizeOptionalColorSetting(value);
+
+						if (!color) {
+							return;
+						}
+
+						colorPicker?.setValue(color);
+						await this.updateBaseNameStyleRuleColor(index, color);
+					})
+			)
+			.addColorPicker((color) => {
+				colorPicker = color;
+				color
+					.setValue(currentColor)
+					.onChange(async (value) => {
+						await this.updateBaseNameStyleRuleColor(index, value);
+					});
+			})
+			.addButton((button) =>
+				button
+					.setButtonText("Remove")
+					.onClick(async () => {
+						this.plugin.settings.baseNameStyleRules.splice(index, 1);
+						await this.plugin.saveSettings();
+						this.plugin.refreshBaseNameStyles();
+						this.display();
+					})
+			);
+	}
+
+	private async updateBaseNameStyleRuleColor(index: number, color: string) {
+		this.plugin.settings.baseNameStyleRules[index] = {
+			...this.plugin.settings.baseNameStyleRules[index],
+			color,
+		};
+		await this.plugin.saveSettings();
+		this.plugin.refreshBaseNameStyles();
 	}
 }
