@@ -1,10 +1,10 @@
-# Image Auto Rename
+# Rename_img
 
-Image Auto Rename is an Obsidian plugin for keeping pasted image workflows tidy. It can rename newly created or pasted images, repair image links after renaming, hide PNG files from the file explorer, and add small helpers for Obsidian Bases.
+Rename_img is an Obsidian plugin for keeping pasted image workflows tidy. It can rename newly created or pasted images, repair image links after renaming, hide PNG files from the file explorer, and add small helpers for Obsidian Bases.
 
 ## Version
 
-Current version: `1.0.4`
+Current version: `1.1.1`
 
 ## Default Settings
 
@@ -25,6 +25,8 @@ Current version: `1.0.4`
 - Add multiple Base name style rules by file extension.
 - Style matching Base name cells with a custom color and bold font weight, including nested text and links inside the cell.
 - Choose Base style colors with either hex input or the color picker.
+- Open a dedicated plugin page from the Obsidian ribbon or command palette.
+- Switch the plugin interface between English and Chinese.
 
 ## Default Base
 

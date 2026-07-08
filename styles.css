@@ -32,3 +32,7 @@ body.image-auto-rename-filename-hover .canvas-node:hover .canvas-node-label {
 	color: var(--image-auto-rename-base-name-color);
 	font-weight: 700;
 }
+
+.image-auto-rename-settings-view {
+	padding: 16px 24px;
+}

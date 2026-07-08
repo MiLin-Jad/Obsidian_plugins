@@ -1,10 +1,16 @@
 # Changelog
 
+## 1.1.1
+
+- Renamed the plugin display name to `Rename_img`.
+- Added English and Chinese interface language switching.
+
 ## 1.0.4
 
 - Fixed Base name style color rules not applying reliably in Bases views.
 - Improved Base name styling for nested text and links inside name cells.
 - Removed the active-file reveal setting because Obsidian's File Explorer can still auto-expand from internal behavior outside the plugin.
+- Added a dedicated Obsidian ribbon page and command palette action for plugin controls.
 
 ## 1.0.3
 

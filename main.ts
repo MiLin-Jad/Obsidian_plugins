@@ -1,6 +1,7 @@
-import { App, ColorComponent, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, normalizePath } from "obsidian";
+import { App, ColorComponent, ItemView, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, WorkspaceLeaf, normalizePath } from "obsidian";
 
 type FilenameDisplayMode = "show" | "hide" | "hover";
+type UiLanguage = "en" | "zh";
 
 interface CanvasFileNode {
 	id?: string;
@@ -31,6 +32,7 @@ interface BaseNameStyleRule {
 interface ImageAutoRenameSettings {
 	settingsVersion: number;
 	targetFolder: string;
+	language: UiLanguage;
 	filenameDisplayMode: FilenameDisplayMode;
 	hidePngInFileList: boolean;
 	baseNameStyleRules: BaseNameStyleRule[];
@@ -44,6 +46,7 @@ type LegacyImageAutoRenameSettings = Partial<ImageAutoRenameSettings> & {
 const DEFAULT_SETTINGS: ImageAutoRenameSettings = {
 	settingsVersion: 3,
 	targetFolder: "",
+	language: "en",
 	filenameDisplayMode: "hover",
 	hidePngInFileList: true,
 	baseNameStyleRules: [
@@ -60,6 +63,7 @@ const DEFAULT_SETTINGS: ImageAutoRenameSettings = {
 
 const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg"]);
 const PROCESSED_NAME_PATTERN = /^.+_\d{6}$/;
+const IMAGE_AUTO_RENAME_VIEW_TYPE = "image-auto-rename-settings-view";
 const DEFAULT_BASE_NAME_STYLE_COLOR = "#3f3f46";
 const DEFAULT_BASE_FILE_NAME = "Files.base";
 const DEFAULT_BASE_CONTENT = `filters:
@@ -91,6 +95,77 @@ views:
       - file.mtime
 `;
 
+const UI_TEXT = {
+	en: {
+		pageTitle: "Rename_img",
+		languageName: "Language",
+		languageDesc: "Choose the display language for this plugin.",
+		languageEnglish: "English",
+		languageChinese: "中文",
+		defaultImageFolderName: "Default image folder",
+		defaultImageFolderDesc: "Folder used for newly created or pasted images. Leave empty to keep images in their original folder.",
+		imageFilenameDisplayName: "Image filename display",
+		imageFilenameDisplayDesc: "Controls whether Canvas image node file names are visible.",
+		show: "Show",
+		hide: "Hide",
+		showOnHover: "Show on hover",
+		hidePngName: "Hide PNG files in file list",
+		hidePngDesc: "Hide .png files from Obsidian's file explorer. The files are only hidden visually and remain in the vault.",
+		baseNameStyleRulesName: "Base name style rules",
+		baseNameStyleRulesDesc: "Color and bold the Base name column by file extension. Add multiple rules for multiple extensions.",
+		addBaseNameStyleRuleName: "Add Base name style rule",
+		addBaseNameStyleRuleDesc: "Add another extension color rule.",
+		addRuleButton: "Add rule",
+		createDefaultBaseName: "Create default base",
+		createDefaultBaseDesc: "Create a Base with filters for not PNG and not Base files, plus the preset visible properties.",
+		createBaseButton: "Create base",
+		creatingButton: "Creating...",
+		renameImagesName: "Rename images in current note",
+		renameImagesDesc: "Check every embedded image in the currently open note and rename unprocessed images.",
+		checkAndRenameButton: "Check and rename",
+		renamingButton: "Renaming...",
+		baseStyleRuleName: "Base style rule",
+		baseStyleRuleDesc: "Matching Base names are colored and bold.",
+		removeButton: "Remove",
+		noActiveFileNotice: "No active file found.",
+		renameFailedNotice: "Failed to rename images in active file. See console for details.",
+	},
+	zh: {
+		pageTitle: "Rename_img",
+		languageName: "语言",
+		languageDesc: "选择这个插件界面的显示语言。",
+		languageEnglish: "English",
+		languageChinese: "中文",
+		defaultImageFolderName: "默认图片文件夹",
+		defaultImageFolderDesc: "新建或粘贴图片时使用的文件夹。留空则保持图片原来的位置。",
+		imageFilenameDisplayName: "图片文件名显示",
+		imageFilenameDisplayDesc: "控制 Canvas 图片节点的文件名是否显示。",
+		show: "显示",
+		hide: "隐藏",
+		showOnHover: "悬停显示",
+		hidePngName: "在文件列表隐藏 PNG 文件",
+		hidePngDesc: "从 Obsidian 文件列表中隐藏 .png 文件。文件只是在界面上隐藏，仍然保留在库中。",
+		baseNameStyleRulesName: "Base 名称样式规则",
+		baseNameStyleRulesDesc: "按扩展名给 Base 的名称列设置颜色并加粗。可以添加多条规则。",
+		addBaseNameStyleRuleName: "添加 Base 名称样式规则",
+		addBaseNameStyleRuleDesc: "添加另一条扩展名颜色规则。",
+		addRuleButton: "添加规则",
+		createDefaultBaseName: "创建默认 Base",
+		createDefaultBaseDesc: "创建一个 Base，内置排除 PNG 和 Base 文件的过滤规则，并带有默认显示属性。",
+		createBaseButton: "创建 Base",
+		creatingButton: "创建中...",
+		renameImagesName: "重命名当前笔记中的图片",
+		renameImagesDesc: "检查当前打开笔记中嵌入的图片，并重命名未处理过的图片。",
+		checkAndRenameButton: "检查并重命名",
+		renamingButton: "重命名中...",
+		baseStyleRuleName: "Base 样式规则",
+		baseStyleRuleDesc: "匹配的 Base 名称会变成彩色并加粗。",
+		removeButton: "删除",
+		noActiveFileNotice: "没有找到当前文件。",
+		renameFailedNotice: "重命名当前文件中的图片失败。请查看控制台了解详情。",
+	},
+} satisfies Record<UiLanguage, Record<string, string>>;
+
 export default class ImageAutoRenamePlugin extends Plugin {
 	settings: ImageAutoRenameSettings;
 	private processingPaths = new Set<string>();
@@ -107,13 +182,24 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		this.applyFileListCss();
 		this.startBaseStyleObserver();
 		this.scheduleBaseStyleRefresh();
+		this.registerView(IMAGE_AUTO_RENAME_VIEW_TYPE, (leaf) => new ImageAutoRenameSettingsView(leaf, this));
 		this.addSettingTab(new ImageAutoRenameSettingTab(this.app, this));
+		this.addRibbonIcon("settings", this.t("pageTitle"), () => {
+			void this.openSettingsView();
+		});
 
 		this.addCommand({
 			id: "create-default-base",
 			name: "Create default base",
 			callback: () => {
 				void this.createDefaultBase();
+			},
+		});
+		this.addCommand({
+			id: "open-settings-view",
+			name: `Open ${this.t("pageTitle")} page`,
+			callback: () => {
+				void this.openSettingsView();
 			},
 		});
 		this.registerEvent(
@@ -142,6 +228,25 @@ export default class ImageAutoRenamePlugin extends Plugin {
 			);
 			this.scheduleBaseStyleRefresh();
 		});
+	}
+
+	private async openSettingsView() {
+		const existingLeaf = this.app.workspace.getLeavesOfType(IMAGE_AUTO_RENAME_VIEW_TYPE)[0];
+		const leaf = existingLeaf ?? this.app.workspace.getLeaf(true);
+
+		await leaf.setViewState({
+			type: IMAGE_AUTO_RENAME_VIEW_TYPE,
+			active: true,
+		});
+		this.app.workspace.revealLeaf(leaf);
+	}
+
+	t(key: keyof typeof UI_TEXT.en) {
+		return UI_TEXT[this.settings.language]?.[key] ?? UI_TEXT.en[key];
+	}
+
+	normalizeLanguageSetting(language: string | undefined): UiLanguage {
+		return language === "zh" || language === "en" ? language : DEFAULT_SETTINGS.language;
 	}
 
 	onunload() {
@@ -183,7 +288,7 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		const activeFile = this.app.workspace.getActiveFile();
 
 		if (!activeFile) {
-			new Notice("No active file found.");
+			new Notice(this.t("noActiveFileNotice"));
 			return;
 		}
 
@@ -191,7 +296,7 @@ export default class ImageAutoRenamePlugin extends Plugin {
 			.then(() => this.renameImagesInFile(activeFile))
 			.catch((error) => {
 				console.error("Failed to rename images in active file:", error);
-				new Notice("Failed to rename images in active file. See console for details.");
+				new Notice(this.t("renameFailedNotice"));
 			});
 
 		await this.renameQueue;
@@ -821,6 +926,7 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		return {
 			settingsVersion: DEFAULT_SETTINGS.settingsVersion,
 			targetFolder: settings?.targetFolder ?? DEFAULT_SETTINGS.targetFolder,
+			language: this.normalizeLanguageSetting(settings?.language),
 			filenameDisplayMode: this.normalizeFilenameDisplayMode(filenameDisplayMode, isLegacySettings),
 			hidePngInFileList: isLegacySettings && hidePngInFileList === false ? DEFAULT_SETTINGS.hidePngInFileList : hidePngInFileList,
 			baseNameStyleRules: this.normalizeBaseNameStyleRules(settings, isLegacySettings),
@@ -1160,6 +1266,39 @@ export default class ImageAutoRenamePlugin extends Plugin {
 	}
 }
 
+class ImageAutoRenameSettingsView extends ItemView {
+	private plugin: ImageAutoRenamePlugin;
+	private settingTab: ImageAutoRenameSettingTab;
+
+	constructor(leaf: WorkspaceLeaf, plugin: ImageAutoRenamePlugin) {
+		super(leaf);
+		this.plugin = plugin;
+		this.settingTab = new ImageAutoRenameSettingTab(plugin.app, plugin);
+	}
+
+	getViewType() {
+		return IMAGE_AUTO_RENAME_VIEW_TYPE;
+	}
+
+	getDisplayText() {
+		return this.plugin.t("pageTitle");
+	}
+
+	getIcon() {
+		return "settings";
+	}
+
+	async onOpen() {
+		this.contentEl.empty();
+		this.contentEl.addClass("image-auto-rename-settings-view");
+		this.settingTab.renderInto(this.contentEl);
+	}
+
+	async onClose() {
+		this.contentEl.removeClass("image-auto-rename-settings-view");
+	}
+}
+
 class ImageAutoRenameSettingTab extends PluginSettingTab {
 	plugin: ImageAutoRenamePlugin;
 
@@ -1169,17 +1308,33 @@ class ImageAutoRenameSettingTab extends PluginSettingTab {
 	}
 
 	display() {
-		this.render();
+		this.renderInto(this.containerEl);
 	}
 
-	private render() {
-		const { containerEl } = this;
-
+	renderInto(containerEl: HTMLElement) {
 		containerEl.empty();
+		containerEl.createEl("h2", {
+			text: this.plugin.t("pageTitle"),
+		});
 
 		new Setting(containerEl)
-			.setName("Default image folder")
-			.setDesc("Folder used for newly created or pasted images. Leave empty to keep images in their original folder.")
+			.setName(this.plugin.t("languageName"))
+			.setDesc(this.plugin.t("languageDesc"))
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption("en", this.plugin.t("languageEnglish"))
+					.addOption("zh", this.plugin.t("languageChinese"))
+					.setValue(this.plugin.settings.language)
+					.onChange(async (value) => {
+						this.plugin.settings.language = this.plugin.normalizeLanguageSetting(value);
+						await this.plugin.saveSettings();
+						this.renderInto(containerEl);
+					})
+			);
+
+		new Setting(containerEl)
+			.setName(this.plugin.t("defaultImageFolderName"))
+			.setDesc(this.plugin.t("defaultImageFolderDesc"))
 			.addText((text) =>
 				text
 					.setPlaceholder("Assets/Images")
@@ -1191,13 +1346,13 @@ class ImageAutoRenameSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Image filename display")
-			.setDesc("Controls whether Canvas image node file names are visible.")
+			.setName(this.plugin.t("imageFilenameDisplayName"))
+			.setDesc(this.plugin.t("imageFilenameDisplayDesc"))
 			.addDropdown((dropdown) =>
 				dropdown
-					.addOption("show", "Show")
-					.addOption("hide", "Hide")
-					.addOption("hover", "Show on hover")
+					.addOption("show", this.plugin.t("show"))
+					.addOption("hide", this.plugin.t("hide"))
+					.addOption("hover", this.plugin.t("showOnHover"))
 					.setValue(this.plugin.settings.filenameDisplayMode)
 					.onChange(async (value) => {
 						this.plugin.settings.filenameDisplayMode = value as FilenameDisplayMode;
@@ -1207,8 +1362,8 @@ class ImageAutoRenameSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Hide PNG files in file list")
-			.setDesc("Hide .png files from Obsidian's file explorer. The files are only hidden visually and remain in the vault.")
+			.setName(this.plugin.t("hidePngName"))
+			.setDesc(this.plugin.t("hidePngDesc"))
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.hidePngInFileList)
@@ -1220,19 +1375,19 @@ class ImageAutoRenameSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Base name style rules")
-			.setDesc("Color and bold the Base name column by file extension. Add multiple rules for multiple extensions.");
+			.setName(this.plugin.t("baseNameStyleRulesName"))
+			.setDesc(this.plugin.t("baseNameStyleRulesDesc"));
 
 		this.plugin.settings.baseNameStyleRules.forEach((rule, index) => {
 			this.addBaseNameStyleRuleSetting(containerEl, rule, index);
 		});
 
 		new Setting(containerEl)
-			.setName("Add Base name style rule")
-			.setDesc("Add another extension color rule.")
+			.setName(this.plugin.t("addBaseNameStyleRuleName"))
+			.setDesc(this.plugin.t("addBaseNameStyleRuleDesc"))
 			.addButton((button) =>
 				button
-					.setButtonText("Add rule")
+					.setButtonText(this.plugin.t("addRuleButton"))
 					.setCta()
 					.onClick(async () => {
 						const extensions = this.plugin.getAvailableBaseStyleExtensions();
@@ -1245,46 +1400,46 @@ class ImageAutoRenameSettingTab extends PluginSettingTab {
 						});
 						await this.plugin.saveSettings();
 						this.plugin.refreshBaseNameStyles();
-						this.render();
+						this.renderInto(containerEl);
 					})
 			);
 
 		new Setting(containerEl)
-			.setName("Create default base")
-			.setDesc("Create a Base with filters for not PNG and not Base files, plus the preset visible properties.")
+			.setName(this.plugin.t("createDefaultBaseName"))
+			.setDesc(this.plugin.t("createDefaultBaseDesc"))
 			.addButton((button) =>
 				button
-					.setButtonText("Create base")
+					.setButtonText(this.plugin.t("createBaseButton"))
 					.setCta()
 					.onClick(async () => {
 						button.setDisabled(true);
-						button.setButtonText("Creating...");
+						button.setButtonText(this.plugin.t("creatingButton"));
 
 						try {
 							await this.plugin.createDefaultBase();
 						} finally {
 							button.setDisabled(false);
-							button.setButtonText("Create base");
+							button.setButtonText(this.plugin.t("createBaseButton"));
 						}
 					})
 			);
 
 		new Setting(containerEl)
-			.setName("Rename images in current note")
-			.setDesc("Check every embedded image in the currently open note and rename unprocessed images.")
+			.setName(this.plugin.t("renameImagesName"))
+			.setDesc(this.plugin.t("renameImagesDesc"))
 			.addButton((button) =>
 				button
-					.setButtonText("Check and rename")
+					.setButtonText(this.plugin.t("checkAndRenameButton"))
 					.setCta()
 					.onClick(async () => {
 						button.setDisabled(true);
-						button.setButtonText("Renaming...");
+						button.setButtonText(this.plugin.t("renamingButton"));
 
 						try {
 							await this.plugin.renameImagesInActiveNote();
 						} finally {
 							button.setDisabled(false);
-							button.setButtonText("Check and rename");
+							button.setButtonText(this.plugin.t("checkAndRenameButton"));
 						}
 					})
 			);
@@ -1295,8 +1450,8 @@ class ImageAutoRenameSettingTab extends PluginSettingTab {
 		const currentColor = this.plugin.normalizeColorSetting(rule.color);
 
 		new Setting(containerEl)
-			.setName(`Base style rule ${index + 1}`)
-			.setDesc("Matching Base names are colored and bold.")
+			.setName(`${this.plugin.t("baseStyleRuleName")} ${index + 1}`)
+			.setDesc(this.plugin.t("baseStyleRuleDesc"))
 			.addDropdown((dropdown) => {
 				const extensions = this.plugin.getAvailableBaseStyleExtensions();
 				const currentExtension = this.plugin.normalizeExtensionSetting(rule.extension);
@@ -1316,7 +1471,7 @@ class ImageAutoRenameSettingTab extends PluginSettingTab {
 					};
 					await this.plugin.saveSettings();
 					this.plugin.refreshBaseNameStyles();
-					this.render();
+					this.renderInto(containerEl);
 				});
 			})
 			.addText((text) =>
@@ -1344,12 +1499,12 @@ class ImageAutoRenameSettingTab extends PluginSettingTab {
 			})
 			.addButton((button) =>
 				button
-					.setButtonText("Remove")
+					.setButtonText(this.plugin.t("removeButton"))
 					.onClick(async () => {
 						this.plugin.settings.baseNameStyleRules.splice(index, 1);
 						await this.plugin.saveSettings();
 						this.plugin.refreshBaseNameStyles();
-						this.render();
+						this.renderInto(containerEl);
 					})
 			);
 	}
