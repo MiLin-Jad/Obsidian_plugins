@@ -33,23 +33,7 @@ interface ImageAutoRenameSettings {
 	targetFolder: string;
 	filenameDisplayMode: FilenameDisplayMode;
 	hidePngInFileList: boolean;
-	autoRevealActiveFile: boolean;
 	baseNameStyleRules: BaseNameStyleRule[];
-}
-
-interface FileExplorerAutoRevealOptions {
-	autoReveal?: boolean;
-	autoRevealActiveFile?: boolean;
-}
-
-interface FileExplorerInstance {
-	autoReveal?: boolean;
-	options?: FileExplorerAutoRevealOptions;
-	saveOptions?: () => void | Promise<void>;
-}
-
-interface InternalPlugins {
-	plugins?: Record<string, { instance?: FileExplorerInstance } | undefined>;
 }
 
 type LegacyImageAutoRenameSettings = Partial<ImageAutoRenameSettings> & {
@@ -62,7 +46,6 @@ const DEFAULT_SETTINGS: ImageAutoRenameSettings = {
 	targetFolder: "",
 	filenameDisplayMode: "hover",
 	hidePngInFileList: true,
-	autoRevealActiveFile: false,
 	baseNameStyleRules: [
 		{
 			extension: "canvas",
@@ -117,11 +100,9 @@ export default class ImageAutoRenamePlugin extends Plugin {
 	private baseStyleObserver: MutationObserver | null = null;
 	private baseStyleTimeout: number | null = null;
 	private baseStyleRetryTimeouts: number[] = [];
-	private autoRevealTimeout: number | null = null;
 
 	async onload() {
 		await this.loadSettings();
-		this.syncFileExplorerAutoRevealSetting();
 		this.applyFilenameDisplayCss();
 		this.applyFileListCss();
 		this.startBaseStyleObserver();
@@ -135,7 +116,6 @@ export default class ImageAutoRenamePlugin extends Plugin {
 				void this.createDefaultBase();
 			},
 		});
-
 		this.registerEvent(
 			this.app.workspace.on("layout-change", () => {
 				this.scheduleBaseStyleRefresh();
@@ -144,13 +124,11 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		this.registerEvent(
 			this.app.workspace.on("file-open", () => {
 				this.scheduleBaseStyleRefresh();
-				this.queueRevealActiveFile();
 			})
 		);
 		this.registerEvent(
 			this.app.workspace.on("active-leaf-change", () => {
 				this.scheduleBaseStyleRefresh();
-				this.queueRevealActiveFile();
 			})
 		);
 
@@ -170,7 +148,6 @@ export default class ImageAutoRenamePlugin extends Plugin {
 		this.removeFilenameDisplayCss();
 		this.removeFileListCss();
 		this.stopBaseStyleObserver();
-		this.clearAutoRevealTimeout();
 		void this.saveSettings();
 	}
 
@@ -846,7 +823,6 @@ export default class ImageAutoRenamePlugin extends Plugin {
 			targetFolder: settings?.targetFolder ?? DEFAULT_SETTINGS.targetFolder,
 			filenameDisplayMode: this.normalizeFilenameDisplayMode(filenameDisplayMode, isLegacySettings),
 			hidePngInFileList: isLegacySettings && hidePngInFileList === false ? DEFAULT_SETTINGS.hidePngInFileList : hidePngInFileList,
-			autoRevealActiveFile: typeof settings?.autoRevealActiveFile === "boolean" ? settings.autoRevealActiveFile : DEFAULT_SETTINGS.autoRevealActiveFile,
 			baseNameStyleRules: this.normalizeBaseNameStyleRules(settings, isLegacySettings),
 		};
 	}
@@ -909,81 +885,6 @@ export default class ImageAutoRenamePlugin extends Plugin {
 			extension,
 			color: this.normalizeColorSetting(rule?.color),
 		};
-	}
-
-	queueRevealActiveFile() {
-		this.clearAutoRevealTimeout();
-		this.syncFileExplorerAutoRevealSetting();
-
-		if (!this.settings.autoRevealActiveFile) {
-			return;
-		}
-
-		this.autoRevealTimeout = window.setTimeout(() => {
-			this.autoRevealTimeout = null;
-			this.revealActiveFileInExplorer();
-		}, 150);
-	}
-
-	clearAutoRevealTimeout() {
-		if (this.autoRevealTimeout === null) {
-			return;
-		}
-
-		window.clearTimeout(this.autoRevealTimeout);
-		this.autoRevealTimeout = null;
-	}
-
-	private revealActiveFileInExplorer() {
-		const activeFile = this.app.workspace.getActiveFile();
-
-		if (!activeFile) {
-			return;
-		}
-
-		const commands = (this.app as App & { commands?: { executeCommandById?: (id: string) => boolean } }).commands;
-
-		if (!commands?.executeCommandById) {
-			console.warn("Cannot reveal active file: Obsidian command API is unavailable.");
-			return;
-		}
-
-		commands.executeCommandById("file-explorer:reveal-active-file");
-	}
-
-	syncFileExplorerAutoRevealSetting() {
-		const fileExplorer = this.getFileExplorerInstance();
-
-		if (!fileExplorer) {
-			return;
-		}
-
-		let changed = false;
-
-		if (typeof fileExplorer.autoReveal === "boolean" && fileExplorer.autoReveal !== this.settings.autoRevealActiveFile) {
-			fileExplorer.autoReveal = this.settings.autoRevealActiveFile;
-			changed = true;
-		}
-
-		if (fileExplorer.options) {
-			for (const key of ["autoReveal", "autoRevealActiveFile"] as const) {
-				if (typeof fileExplorer.options[key] === "boolean" && fileExplorer.options[key] !== this.settings.autoRevealActiveFile) {
-					fileExplorer.options[key] = this.settings.autoRevealActiveFile;
-					changed = true;
-				}
-			}
-		}
-
-		if (changed && fileExplorer.saveOptions) {
-			void Promise.resolve(fileExplorer.saveOptions()).catch((error) => {
-				console.error("Failed to save File Explorer auto reveal setting:", error);
-			});
-		}
-	}
-
-	private getFileExplorerInstance() {
-		const appWithInternalPlugins = this.app as App & { internalPlugins?: InternalPlugins };
-		return appWithInternalPlugins.internalPlugins?.plugins?.["file-explorer"]?.instance ?? null;
 	}
 
 	private getActiveDocument(): Document {
@@ -1315,25 +1216,6 @@ class ImageAutoRenameSettingTab extends PluginSettingTab {
 						this.plugin.settings.hidePngInFileList = value;
 						await this.plugin.saveSettings();
 						this.plugin.applyFileListCss();
-					})
-			);
-
-		new Setting(containerEl)
-			.setName("Reveal active file in file list")
-			.setDesc("Automatically expand the file explorer to the active file when opening or switching files.")
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.autoRevealActiveFile)
-					.onChange(async (value) => {
-						this.plugin.settings.autoRevealActiveFile = value;
-						await this.plugin.saveSettings();
-						this.plugin.syncFileExplorerAutoRevealSetting();
-
-						if (value) {
-							this.plugin.queueRevealActiveFile();
-						} else {
-							this.plugin.clearAutoRevealTimeout();
-						}
 					})
 			);
 

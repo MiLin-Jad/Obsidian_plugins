@@ -4,13 +4,12 @@ Image Auto Rename is an Obsidian plugin for keeping pasted image workflows tidy.
 
 ## Version
 
-Current version: `1.0.3`
+Current version: `1.0.4`
 
 ## Default Settings
 
 - `Image filename display`: `Show on hover`
 - `Hide PNG files in file list`: Enabled
-- `Reveal active file in file list`: Disabled
 - `Base style rule 1`: `canvas` / `#f9a8d4`
 - `Base style rule 2`: `md` / `#3f3f46`
 
@@ -26,7 +25,6 @@ Current version: `1.0.3`
 - Add multiple Base name style rules by file extension.
 - Style matching Base name cells with a custom color and bold font weight, including nested text and links inside the cell.
 - Choose Base style colors with either hex input or the color picker.
-- Optionally reveal the active file in the file explorer when switching files. When disabled, the plugin also tries to disable Obsidian File Explorer auto-reveal.
 
 ## Default Base
 

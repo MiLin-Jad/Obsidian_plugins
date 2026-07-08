@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.4
+
+- Fixed Base name style color rules not applying reliably in Bases views.
+- Improved Base name styling for nested text and links inside name cells.
+- Removed the active-file reveal setting because Obsidian's File Explorer can still auto-expand from internal behavior outside the plugin.
+
 ## 1.0.3
 
 - Prepared the plugin for Obsidian community plugin review.

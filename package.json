@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-image-auto-rename",
-	"version": "1.0.3",
+	"version": "1.0.4",
 	"description": "Obsidian plugin for image auto rename, file list cleanup, and Bases helpers.",
 	"main": "main.js",
 	"scripts": {
